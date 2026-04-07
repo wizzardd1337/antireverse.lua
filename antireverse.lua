@@ -1,7 +1,9 @@
 --[[
-    Solance Anti-Reverse Engineering Shield
+    Solance Anti-Reverse Engineering Shield v2
     Detects and punishes attempts to decompile, hook, spy on, or extract the cheat source.
     If a violation is detected, the user receives a permanent ban via Supabase.
+    
+    v2: Added whitelist system to prevent false positives from our own code.
 ]]
 
 local AntiReverse = {}
@@ -14,12 +16,27 @@ local _REQUEST_FUNC = nil
 local _LIBRARY = nil
 local _TRIGGERED = false
 
+-- Whitelist flag: when true, our own code is calling a hooked function
+-- so the guard should let it through without punishing
+local _SELF_CALL = false
+
 function AntiReverse.Init(config)
     _SUPABASE_URL = config.supabase_url
     _SUPABASE_KEY = config.supabase_key
     _USER_ID = config.user_id
     _REQUEST_FUNC = config.request_func
     _LIBRARY = config.library
+end
+
+-- Allow our own cheat code to safely call hooked functions
+function AntiReverse.AllowCall(fn)
+    _SELF_CALL = true
+    local results = {pcall(fn)}
+    _SELF_CALL = false
+    if results[1] then
+        return unpack(results, 2)
+    end
+    return nil
 end
 
 -- ============================================================
@@ -29,7 +46,7 @@ local function Punish(reason)
     if _TRIGGERED then return end
     _TRIGGERED = true
 
-    local banReason = "anti-reverse: " .. tostring(reason)
+    local banReason = "Anti-Reverse: " .. tostring(reason)
 
     -- 1. Write ban to database
     pcall(function()
@@ -71,23 +88,22 @@ end
 -- GUARD 1: Anti-Spy (Remote Spy / Script Spy detection)
 -- ============================================================
 local function Guard_AntiSpy()
-    -- Common remote spy tools create ScreenGuis with known names
     local spySignatures = {
-        "SimpleSpy", "RemoteSpy", "Hydroxide", "Dex", "DexV4",
-        "InfYield", "ScriptDumper", "SynapseXen", "OH_GUI",
-        "SimpleSpy_Main", "remote_spy", "HttpSpy"
+        "simplespy", "remotespy", "hydroxide", "dex", "dexv4",
+        "infyield", "scriptdumper", "synapsexen", "oh_gui",
+        "simplespy_main", "remote_spy", "httpspy"
     }
 
     task.spawn(function()
         while true do
             if _TRIGGERED then break end
+            if _LIBRARY and _LIBRARY.Unloaded then break end
             pcall(function()
-                -- Check CoreGui for spy tools
                 for _, gui in pairs(game:GetService("CoreGui"):GetChildren()) do
                     if gui:IsA("ScreenGui") then
                         local name = string.lower(gui.Name)
                         for _, sig in ipairs(spySignatures) do
-                            if string.find(name, string.lower(sig)) then
+                            if string.find(name, sig) then
                                 Punish("remote spy detected: " .. gui.Name)
                                 return
                             end
@@ -95,15 +111,14 @@ local function Guard_AntiSpy()
                     end
                 end
 
-                -- Check PlayerGui too
                 local pgui = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
                 if pgui then
                     for _, gui in pairs(pgui:GetChildren()) do
                         if gui:IsA("ScreenGui") then
                             local name = string.lower(gui.Name)
                             for _, sig in ipairs(spySignatures) do
-                                if string.find(name, string.lower(sig)) then
-                                    Punish("spy tool detected in PlayerGui: " .. gui.Name)
+                                if string.find(name, sig) then
+                                    Punish("spy tool in PlayerGui: " .. gui.Name)
                                     return
                                 end
                             end
@@ -117,10 +132,9 @@ local function Guard_AntiSpy()
 end
 
 -- ============================================================
--- GUARD 2: Anti-Decompile (debug.getinfo / debug.getupvalue)
+-- GUARD 2: Anti-Decompile (debug library snooping)
 -- ============================================================
 local function Guard_AntiDecompile()
-    -- Wrap debug functions to detect snooping on our closures
     local _protectedClosures = {}
 
     function AntiReverse.Protect(fn)
@@ -128,84 +142,40 @@ local function Guard_AntiDecompile()
         return fn
     end
 
-    -- Monitor debug.getinfo
-    if debug and debug.getinfo then
-        local realGetInfo = debug.getinfo
-        debug.getinfo = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.getinfo called on protected function")
+    local function wrapDebug(name)
+        local lib = debug
+        if not lib then return end
+        local original = rawget(lib, name)
+        if not original then return end
+
+        rawset(lib, name, function(fn, ...)
+            if not _SELF_CALL and type(fn) == "function" and _protectedClosures[fn] then
+                Punish(name .. " called on protected function")
             end
-            return realGetInfo(fn, ...)
-        end
+            return original(fn, ...)
+        end)
     end
 
-    -- Monitor debug.getupvalue
-    if debug and debug.getupvalue then
-        local realGetUpvalue = debug.getupvalue
-        debug.getupvalue = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.getupvalue called on protected function")
-            end
-            return realGetUpvalue(fn, ...)
-        end
-    end
-
-    -- Monitor debug.setupvalue
-    if debug and debug.setupvalue then
-        local realSetUpvalue = debug.setupvalue
-        debug.setupvalue = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.setupvalue called on protected function")
-            end
-            return realSetUpvalue(fn, ...)
-        end
-    end
-
-    -- Monitor debug.getupvalues (plural, some executors have this)
-    if debug and rawget(debug, "getupvalues") then
-        local realGetUpvalues = debug.getupvalues
-        debug.getupvalues = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.getupvalues called on protected function")
-            end
-            return realGetUpvalues(fn, ...)
-        end
-    end
-
-    -- Monitor debug.getconstants
-    if debug and rawget(debug, "getconstants") then
-        local realGetConstants = debug.getconstants
-        debug.getconstants = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.getconstants called on protected function")
-            end
-            return realGetConstants(fn, ...)
-        end
-    end
-
-    -- Monitor debug.getprotos
-    if debug and rawget(debug, "getprotos") then
-        local realGetProtos = debug.getprotos
-        debug.getprotos = function(fn, ...)
-            if type(fn) == "function" and _protectedClosures[fn] then
-                Punish("debug.getprotos called on protected function")
-            end
-            return realGetProtos(fn, ...)
-        end
-    end
+    wrapDebug("getinfo")
+    wrapDebug("getupvalue")
+    wrapDebug("setupvalue")
+    wrapDebug("getupvalues")
+    wrapDebug("getconstants")
+    wrapDebug("getprotos")
 end
 
 -- ============================================================
 -- GUARD 3: Anti-getgc (GC table scanning)
+-- Only triggers for EXTERNAL callers, not our own code
 -- ============================================================
 local function Guard_AntiGetGC()
     if not getgc then return end
     
     local realGetGC = getgc
     getgc = function(...)
-        -- If someone calls getgc while our cheat is loaded, flag it
-        -- (legitimate scripts almost never call getgc)
-        Punish("getgc called — gc scanning attempt")
+        if not _SELF_CALL then
+            Punish("getgc called — gc scanning attempt")
+        end
         return realGetGC(...)
     end
 end
@@ -216,7 +186,6 @@ end
 local function Guard_AntiHookFunction()
     if not hookfunction then return end
 
-    -- Store fingerprints of critical executor functions we use
     local criticalFuncs = {}
     
     local function snapshot(name, fn)
@@ -232,10 +201,10 @@ local function Guard_AntiHookFunction()
     snapshot("hookmetamethod", hookmetamethod)
     snapshot("newcclosure", newcclosure)
 
-    -- Periodically verify nobody replaced our critical functions
     task.spawn(function()
         while true do
             if _TRIGGERED then break end
+            if _LIBRARY and _LIBRARY.Unloaded then break end
             for name, data in pairs(criticalFuncs) do
                 if tostring(data.ref) ~= data.addr then
                     Punish("critical function tampered: " .. name)
@@ -251,11 +220,12 @@ end
 -- GUARD 5: Anti-SaveInstance
 -- ============================================================
 local function Guard_AntiSaveInstance()
-    -- Detect saveinstance / saveplace calls
     if saveinstance then
         local realSave = saveinstance
         saveinstance = function(...)
-            Punish("saveinstance called — game dump attempt")
+            if not _SELF_CALL then
+                Punish("saveinstance called — game dump attempt")
+            end
             return realSave(...)
         end
     end
@@ -263,7 +233,9 @@ local function Guard_AntiSaveInstance()
     if saveplace then
         local realSave = saveplace
         saveplace = function(...)
-            Punish("saveplace called — game dump attempt")
+            if not _SELF_CALL then
+                Punish("saveplace called — game dump attempt")
+            end
             return realSave(...)
         end
     end
@@ -271,16 +243,16 @@ end
 
 -- ============================================================
 -- GUARD 6: Anti-getsenv (Script Environment sniffing)
+-- Whitelisted for our own skinchanger code
 -- ============================================================
 local function Guard_AntiGetSenv()
-    -- Not all executors have getsenv
     if not getsenv then return end
 
     local realGetsenv = getsenv
     getsenv = function(scr, ...)
-        -- Only flag if they're scanning scripts while our cheat runs
-        -- This is almost always used for reversing
-        Punish("getsenv called — script environment dump attempt")
+        if not _SELF_CALL then
+            Punish("getsenv called — script environment dump attempt")
+        end
         return realGetsenv(scr, ...)
     end
 end
@@ -292,7 +264,9 @@ local function Guard_AntiDecompileFunc()
     if decompile then
         local realDecompile = decompile
         decompile = function(fn, ...)
-            Punish("decompile() called — source extraction attempt")
+            if not _SELF_CALL then
+                Punish("decompile() called — source extraction attempt")
+            end
             return realDecompile(fn, ...)
         end
     end
@@ -300,7 +274,9 @@ local function Guard_AntiDecompileFunc()
     if disassemble then
         local realDisassemble = disassemble
         disassemble = function(fn, ...)
-            Punish("disassemble() called — bytecode extraction attempt")
+            if not _SELF_CALL then
+                Punish("disassemble() called — bytecode extraction attempt")
+            end
             return realDisassemble(fn, ...)
         end
     end
@@ -314,28 +290,35 @@ local function Guard_AntiGetScripts()
 
     local realGetScripts = getscripts
     getscripts = function(...)
-        Punish("getscripts called — script enumeration attempt")
+        if not _SELF_CALL then
+            Punish("getscripts called — script enumeration attempt")
+        end
         return realGetScripts(...)
     end
 end
 
 -- ============================================================
--- GUARD 9: Anti-require hook (ModuleScript extraction)
+-- GUARD 9: Anti-require flood (ModuleScript mass extraction)
 -- ============================================================
 local function Guard_AntiRequire()
     if not require then return end
 
-    -- Monitor if someone is trying to require game modules to reverse them
-    -- We wrap the global require to detect bulk scanning
     local requireCount = 0
-    local requireStart = tick()
+    local requireWindow = tick()
     local realRequire = require
 
     require = function(mod, ...)
-        requireCount = requireCount + 1
-        -- If someone is mass-requiring modules (>10 in 5 seconds), that's sus
-        if requireCount > 10 and (tick() - requireStart) < 5 then
-            Punish("mass require detected — module extraction attempt")
+        if not _SELF_CALL then
+            requireCount = requireCount + 1
+            -- Reset counter every 10 seconds
+            if (tick() - requireWindow) > 10 then
+                requireCount = 1
+                requireWindow = tick()
+            end
+            -- If someone is mass-requiring (>15 in 10 seconds), that's reversing
+            if requireCount > 15 then
+                Punish("mass require detected — module extraction attempt")
+            end
         end
         return realRequire(mod, ...)
     end
@@ -348,16 +331,14 @@ local function Guard_IntegrityCheck()
     task.spawn(function()
         while true do
             if _TRIGGERED then break end
+            if _LIBRARY and _LIBRARY.Unloaded then break end
             task.wait(15)
 
-            -- Verify the Solance_CounterBlox_Loaded flag hasn't been cleared externally
-            -- (someone trying to re-inject while bypassing the duplicate check)
             if not getgenv().Solance_CounterBlox_Loaded and not (_LIBRARY and _LIBRARY.Unloaded) then
-                Punish("loaded flag was cleared externally — injection bypass attempt")
+                Punish("loaded flag cleared externally — injection bypass attempt")
                 break
             end
 
-            -- Verify the Library object hasn't been swapped out
             if _LIBRARY and _LIBRARY._SolanceIntegrity then
                 if _LIBRARY._SolanceIntegrity ~= "verified" then
                     Punish("library integrity check failed — object was replaced")
@@ -369,16 +350,15 @@ local function Guard_IntegrityCheck()
 end
 
 -- ============================================================
--- GUARD 11: Anti-HttpSpy (detect interception of our API calls)
+-- GUARD 11: Anti-HttpSpy (detect interception of API calls)
 -- ============================================================
 local function Guard_AntiHttpSpy()
     task.spawn(function()
         while true do
             if _TRIGGERED then break end
+            if _LIBRARY and _LIBRARY.Unloaded then break end
             task.wait(8)
 
-            -- Send a canary request to our own endpoint
-            -- If someone is intercepting HTTP, they might modify or log this
             pcall(function()
                 if _REQUEST_FUNC and _SUPABASE_URL then
                     local canary = _REQUEST_FUNC({
@@ -390,8 +370,6 @@ local function Guard_AntiHttpSpy()
                             ["Content-Type"] = "application/json"
                         }
                     })
-                    -- If the request was intercepted and changed, StatusCode won't be 200
-                    -- (a properly configured Supabase will return 200 with empty array for non-existent IDs)
                     if canary and canary.StatusCode ~= 200 then
                         Punish("http request interception detected")
                     end
@@ -405,7 +383,7 @@ end
 -- START ALL GUARDS
 -- ============================================================
 function AntiReverse.Start()
-    if not _USER_ID then return end -- can't issue bans without user id
+    if not _USER_ID then return end
 
     Guard_AntiSpy()
     Guard_AntiDecompile()
