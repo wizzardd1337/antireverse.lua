@@ -165,20 +165,8 @@ local function Guard_AntiDecompile()
 end
 
 -- ============================================================
--- GUARD 3: Anti-getgc (GC table scanning)
--- Only triggers for EXTERNAL callers, not our own code
+-- GUARD 3: REMOVED — getgc triggers false positives from executor internals
 -- ============================================================
-local function Guard_AntiGetGC()
-    if not getgc then return end
-    
-    local realGetGC = getgc
-    getgc = function(...)
-        if not _SELF_CALL then
-            Punish("getgc called — gc scanning attempt")
-        end
-        return realGetGC(...)
-    end
-end
 
 -- ============================================================
 -- GUARD 4: Anti-hookfunction on critical functions
@@ -242,20 +230,8 @@ local function Guard_AntiSaveInstance()
 end
 
 -- ============================================================
--- GUARD 6: Anti-getsenv (Script Environment sniffing)
--- Whitelisted for our own skinchanger code
+-- GUARD 6: REMOVED — getsenv triggers false positives from executor internals
 -- ============================================================
-local function Guard_AntiGetSenv()
-    if not getsenv then return end
-
-    local realGetsenv = getsenv
-    getsenv = function(scr, ...)
-        if not _SELF_CALL then
-            Punish("getsenv called — script environment dump attempt")
-        end
-        return realGetsenv(scr, ...)
-    end
-end
 
 -- ============================================================
 -- GUARD 7: Anti-Decompile function (decompile / disassemble)
@@ -283,19 +259,8 @@ local function Guard_AntiDecompileFunc()
 end
 
 -- ============================================================
--- GUARD 8: Anti-getscripts (Script enumeration)
+-- GUARD 8: REMOVED — getscripts triggers false positives from executor internals
 -- ============================================================
-local function Guard_AntiGetScripts()
-    if not getscripts then return end
-
-    local realGetScripts = getscripts
-    getscripts = function(...)
-        if not _SELF_CALL then
-            Punish("getscripts called — script enumeration attempt")
-        end
-        return realGetScripts(...)
-    end
-end
 
 -- ============================================================
 -- GUARD 9: Anti-require flood (ModuleScript mass extraction)
@@ -387,12 +352,9 @@ function AntiReverse.Start()
 
     Guard_AntiSpy()
     Guard_AntiDecompile()
-    Guard_AntiGetGC()
     Guard_AntiHookFunction()
     Guard_AntiSaveInstance()
-    Guard_AntiGetSenv()
     Guard_AntiDecompileFunc()
-    Guard_AntiGetScripts()
     Guard_AntiRequire()
     Guard_IntegrityCheck()
     Guard_AntiHttpSpy()
